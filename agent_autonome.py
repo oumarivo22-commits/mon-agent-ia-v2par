@@ -220,15 +220,17 @@ def run_agent():
 # ===================================================================
 # POINT DE DÉPART DU PROGRAMME
 # ===================================================================
+
+# Démarrer l'agent dans un thread séparé pour qu'il ne bloque pas le serveur web
+# C'est la clé pour que Gunicorn puisse démarrer le serveur tout en laissant l'agent tourner.
+logger.info("Démarrage du thread de l'agent en arrière-plan.")
+agent_thread = threading.Thread(target=run_agent, daemon=True)
+agent_thread.start()
+
 if __name__ == "__main__":
-    logger.info("Démarrage du serveur web et de l'agent en arrière-plan.")
-    
-    # Démarrer l'agent dans un thread séparé
-    agent_thread = threading.Thread(target=run_agent, daemon=True)
-    agent_thread.start()
-    
-    # Démarrer le serveur Flask pour répondre aux contrôles de santé de Render
-    # Render définit la variable d'environnement PORT.
+    # Cette partie est principalement pour les tests locaux.
+    # Sur Render, Gunicorn exécute directement l'objet 'app'.
+    logger.info("Démarrage du serveur web Flask pour les tests locaux.")
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-
+                      
