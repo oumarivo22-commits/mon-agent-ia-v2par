@@ -1,10 +1,10 @@
 # ===================================================================
-# AGENT AUTONOME DE CONTENU V1.5 - PUBLICATION WORDPRESS
+# AGENT AUTONOME DE CONTENU V2.0 - PUBLICATION BLOGGER
 #
 # Rôle :
 # 1. Détecte les tendances (Google Trends, Reddit).
-# 2. Génère un article de qualité avec l'IA DeepSeek.
-# 3. Publie automatiquement l'article sur WordPress.
+# 2. Génère un article de qualité avec l'IA.
+# 3. Publie automatiquement l'article sur Blogger.
 # ===================================================================
 
 import os
@@ -13,8 +13,14 @@ import logging
 import re
 import requests
 import threading
+import json
 from typing import List, Dict, Optional
 from flask import Flask
+
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
 
 # --- Configuration du Logging ---
 logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO'), format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -36,7 +42,7 @@ except ImportError:
     logger.warning("Outil 'praw' non trouvé. (pip install praw)")
 
 # ===================================================================
-# MODULE 1 : Le "Radar" (TrendRadar)
+# MODULE 1 : Le "Radar" (TrendRadar) - INCHANGÉ
 # ===================================================================
 class TrendRadar:
     def __init__(self):
@@ -98,16 +104,60 @@ class TrendRadar:
         return best_topic
 
 # ===================================================================
-# MODULE 2 : Le "Moteur" (ContentEngine)
+# MODULE 2 : Le "Moteur" (ContentEngine) - MODIFIÉ POUR BLOGGER
 # ===================================================================
 class ContentEngine:
     def __init__(self):
         self.logger = logging.getLogger('ContentEngine')
         self.logger.info("⚙️ Moteur de contenu initialisé.")
+        self.blogger_service = self._get_blogger_service()
+
+    def _get_blogger_service(self):
+        creds = None
+        
+        # Les informations d'identification sont stockées dans des variables d'environnement
+        token_json_str = os.getenv('GOOGLE_TOKEN_JSON')
+        client_secret_json_str = os.getenv('GOOGLE_CLIENT_SECRET_JSON')
+
+        if not token_json_str or not client_secret_json_str:
+            self.logger.error("❌ Variables d'environnement GOOGLE_TOKEN_JSON ou GOOGLE_CLIENT_SECRET_JSON non trouvées.")
+            return None
+
+        try:
+            token_info = json.loads(token_json_str)
+            creds = Credentials.from_authorized_user_info(token_info)
+        except Exception as e:
+            self.logger.error(f"❌ Erreur lors du chargement de GOOGLE_TOKEN_JSON: {e}")
+            return None
+
+        # Si les identifiants ont expiré, nous essayons de les rafraîchir.
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                client_config = json.loads(client_secret_json_str)
+                creds.refresh(Request(client_config=client_config))
+                # Après un rafraîchissement, nous devrions mettre à jour la variable d'environnement, mais c'est complexe sur Render.
+                # Pour l'instant, cela fonctionnera pour la durée de vie du processus.
+                self.logger.info("✅ Token d'accès rafraîchi.")
+            except Exception as e:
+                self.logger.error(f"❌ Impossible de rafraîchir le token: {e}")
+                self.logger.error("Veuillez ré-exécuter 'authorize_blogger.py' localement pour obtenir un nouveau token.")
+                return None
+        
+        if not creds or not creds.valid:
+            self.logger.error("❌ Identifiants Google non valides.")
+            return None
+
+        try:
+            service = build('blogger', 'v3', credentials=creds)
+            self.logger.info("✅ Service Blogger initialisé avec succès.")
+            return service
+        except Exception as e:
+            self.logger.error(f"❌ Erreur lors de la création du service Blogger: {e}")
+            return None
 
     def generate_content(self, prompt: str) -> Optional[str]:
         api_key = os.getenv('DEEPSEEK_API_KEY')
-        ai_model = os.getenv('AI_MODEL', 'deepseek/deepseek-chat')
+        ai_model = os.getenv('AI_MODEL', 'deepseek/deepseek-r1-0528:free')
         if not api_key:
             self.logger.error("❌ Clé API DEEPSEEK_API_KEY non trouvée.")
             return None
@@ -126,31 +176,39 @@ class ContentEngine:
             self.logger.error(f"❌ Erreur pendant l'écriture par l'IA: {e}")
             return None
 
-    def publish_to_wordpress(self, title: str, content: str) -> bool:
-        """Publie l'article sur WordPress via l'API REST."""
-        wp_url = os.getenv('WP_URL')
-        wp_user = os.getenv('WP_USERNAME')
-        wp_pass = os.getenv('WP_APPLICATION_PASSWORD')
-
-        if not all([wp_url, wp_user, wp_pass]):
-            self.logger.warning("⚠️ Identifiants WordPress non configurés. Publication annulée.")
+    def publish_to_blogger(self, title: str, content: str) -> bool:
+        """Publie l'article sur Blogger via l'API."""
+        if not self.blogger_service:
+            self.logger.error("❌ Le service Blogger n'est pas disponible. Publication annulée.")
             return False
-        
-        api_url = f"{wp_url.rstrip('/')}/wp-json/wp/v2/posts"
-        post_data = {"title": title, "content": content, "status": "publish"}
+            
+        blog_id = os.getenv('BLOGGER_BLOG_ID')
+        if not blog_id:
+            self.logger.error("❌ Variable d'environnement BLOGGER_BLOG_ID non trouvée.")
+            return False
 
-        self.logger.info(f"📤 Publication de l'article sur {wp_url}...")
+        body = {
+            "kind": "blogger#post",
+            "blog": {
+                "id": blog_id
+            },
+            "title": title,
+            "content": content
+        }
+
+        self.logger.info(f"📤 Publication de l'article sur le blog ID {blog_id}...")
         try:
-            response = requests.post(api_url, json=post_data, auth=(wp_user, wp_pass), timeout=30)
-            response.raise_for_status()
-            self.logger.info(f"✅ Article publié avec succès ! URL : {response.json().get('link')}")
+            posts = self.blogger_service.posts()
+            req = posts.insert(blogId=blog_id, body=body, isDraft=False)
+            post = req.execute()
+            self.logger.info(f"✅ Article publié avec succès ! URL : {post.get('url')}")
             return True
         except Exception as e:
-            self.logger.error(f"❌ Erreur de publication WordPress : {e}")
+            self.logger.error(f"❌ Erreur de publication Blogger : {e}")
             return False
 
 # ===================================================================
-# MODULE 3 : Le "Chef d'Orchestre" (AutonomousAgent)
+# MODULE 3 : Le "Chef d'Orchestre" (AutonomousAgent) - MODIFIÉ
 # ===================================================================
 class AutonomousAgent:
     def __init__(self, cycle_hours: int = 12):
@@ -158,13 +216,12 @@ class AutonomousAgent:
         self.content_engine = ContentEngine()
         self.cycle_interval_seconds = cycle_hours * 3600
         self.logger = logging.getLogger('AutonomousAgent')
-        self.logger.info(f"🤖 Agent V1.5 prêt. Cycle de {cycle_hours} heures.")
+        self.logger.info(f"🤖 Agent V2.0 (Blogger) prêt. Cycle de {cycle_hours} heures.")
 
     def create_prompt_from_topic(self, topic: Dict) -> str:
         return (
-            f"Rédige un article de blog détaillé sur le sujet : '{topic['title']}'. "
-            "Structure l'article avec une introduction, plusieurs sections avec des sous-titres, et une conclusion. "
-            "Le ton doit être professionnel. Longueur : environ 800 mots."
+            f"Rédige un article de blog détaillé et bien structuré sur le sujet suivant : '{topic['title']}'. "
+            "Le ton doit être informatif et engageant. Longueur : environ 800 mots."
         )
 
     def run_single_cycle(self):
@@ -178,8 +235,7 @@ class AutonomousAgent:
         prompt = self.create_prompt_from_topic(best_topic)
         article_content = self.content_engine.generate_content(prompt)
         if article_content:
-            # Publication sur WordPress
-            success = self.content_engine.publish_to_wordpress(best_topic['title'], article_content)
+            success = self.content_engine.publish_to_blogger(best_topic['title'], article_content)
             if not success:
                 self.logger.error("Échec de la publication, l'article n'est pas en ligne.")
         else:
@@ -222,15 +278,14 @@ def run_agent():
 # ===================================================================
 
 # Démarrer l'agent dans un thread séparé pour qu'il ne bloque pas le serveur web
-# C'est la clé pour que Gunicorn puisse démarrer le serveur tout en laissant l'agent tourner.
 logger.info("Démarrage du thread de l'agent en arrière-plan.")
 agent_thread = threading.Thread(target=run_agent, daemon=True)
 agent_thread.start()
 
 if __name__ == "__main__":
     # Cette partie est principalement pour les tests locaux.
-    # Sur Render, Gunicorn exécute directement l'objet 'app'.
     logger.info("Démarrage du serveur web Flask pour les tests locaux.")
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-                      
+
+
